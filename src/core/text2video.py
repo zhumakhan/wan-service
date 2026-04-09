@@ -1,0 +1,370 @@
+# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import gc
+import math
+import os
+import random
+import sys
+import logging
+import types
+from typing import List
+from contextlib import contextmanager
+from functools import partial
+
+import torch
+from torch import amp
+import torch.distributed as dist
+from tqdm import tqdm
+from safetensors.torch import load_file
+
+
+from .distributed.fsdp import shard_model
+from .modules.model import WanModel
+from .modules.t5 import T5EncoderModel
+from .modules.vae import WanVAE
+from .utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
+                               get_sampling_sigmas, retrieve_timesteps)
+from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .modules.apg import APG
+
+import numpy as np
+
+def pin_memory_state_dict(state_dict, to_cpu=False):
+    for key in state_dict:
+        state_dict[key] = state_dict[key].pin_memory() if not to_cpu else state_dict[key].cpu().pin_memory()
+    return state_dict
+
+class WanT2V:
+    def __init__(
+        self,
+        config,
+        checkpoint_dir,
+        ckpt,
+        device_id=0,
+        rank=0,
+        t5_fsdp=False,
+        dit_fsdp=False,
+        use_usp=False,
+        t5_cpu=False,
+    ):
+        r"""
+        Initializes the Wan text-to-video generation model components.
+
+        Args:
+            config (EasyDict):
+                Object containing model parameters initialized from config.py
+            checkpoint_dir (`str`):
+                Path to directory containing model checkpoints
+            device_id (`int`,  *optional*, defaults to 0):
+                Id of target GPU device
+            rank (`int`,  *optional*, defaults to 0):
+                Process rank for distributed training
+            t5_fsdp (`bool`, *optional*, defaults to False):
+                Enable FSDP sharding for T5 model
+            dit_fsdp (`bool`, *optional*, defaults to False):
+                Enable FSDP sharding for DiT model
+            use_usp (`bool`, *optional*, defaults to False):
+                Enable distribution strategy of USP.
+            t5_cpu (`bool`, *optional*, defaults to False):
+                Whether to place T5 model on CPU. Only works without t5_fsdp.
+        """
+        self.device = torch.device(f"cuda:{device_id}")
+        self.config = config
+        self.rank = rank
+        self.t5_cpu = t5_cpu
+
+        self.num_train_timesteps = config.num_train_timesteps
+        self.param_dtype = config.param_dtype
+
+        # shard_fn = partial(shard_model, device_id=device_id)
+        # self.text_encoder = T5EncoderModel(
+        #     text_len=config.text_len,
+        #     dtype=config.t5_dtype,
+        #     device=self.device if not t5_cpu else torch.device('cpu'),
+        #     checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
+        #     tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+        #     shard_fn=shard_fn if t5_fsdp else None)
+
+        self.vae_stride = config.vae_stride
+        self.patch_size = config.patch_size
+        
+        # self.vae = WanVAE(
+        #     self.rank,
+        #     vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+        #     device=self.device)
+
+        if self.rank == 0:
+            logging.info(f"Creating Wan model from {ckpt}")
+        
+        with torch.device('meta'):
+            # torch.set_default_dtype(self.param_dtype)
+            self.model = WanModel(
+                patch_size=config.patch_size,
+                dim=config.dim,
+                ffn_dim=config.ffn_dim,
+                freq_dim=config.freq_dim,
+                num_heads=config.num_heads,
+                num_layers=config.num_layers,
+                window_size=config.window_size,
+                qk_norm=config.qk_norm,
+                cross_attn_norm=config.cross_attn_norm,
+                eps=config.eps
+            )
+        self.model.to(dtype=self.param_dtype)
+        self.model.eval().requires_grad_(False)
+        self.model.freqs.to(device=self.device)
+        
+        if rank == 0:
+            state_dict = load_file(ckpt, device='cpu')
+            self.state_dict = pin_memory_state_dict(state_dict, to_cpu=True)
+            logging.info(f"weights are pinned")
+        
+        self.model.to_empty(device=self.device)
+        self.model.load_state_dict(self.state_dict, strict=True, assign=False)
+        logging.info(f"weights are pinned")
+        
+        self.use_usp = use_usp
+        if self.use_usp:
+            from xfuser.core.distributed import \
+                get_sequence_parallel_world_size
+
+            from .distributed.xdit_context_parallel import (usp_attn_forward,
+                                                            usp_dit_forward)
+            for block in self.model.blocks:
+                block.self_attn.forward = types.MethodType(
+                    usp_attn_forward, block.self_attn)
+            self.model.forward = types.MethodType(usp_dit_forward, self.model)
+            self.sp_size = get_sequence_parallel_world_size()
+        else:
+            self.sp_size = 1
+            
+        self.sample_neg_prompt = config.sample_neg_prompt
+
+    def generate(
+        self,
+        input_prompt: List[str] | str,
+        size=(1280, 720),
+        frame_num=81,
+        shift=5.0,
+        sample_solver='unipc',
+        sampling_steps=50,
+        guide_scale=5.0,
+        n_prompt="",
+        seed=-1,
+        offload_model=True,
+        batch_size=1,
+        interactive_callback=None,
+        use_ret_steps=False,
+        use_apg=False,
+        apg_momentum=0.0,
+        apg_eta=0.0,
+        apg_norm_threshold=0.0,
+        **kwargs,
+    ):
+        r"""
+        Generates video frames from text prompt using diffusion process.
+
+        Args:
+            input_prompt (`str`):
+                Text prompt for content generation
+            size (tupele[`int`], *optional*, defaults to (1280,720)):
+                Controls video resolution, (width,height).
+            frame_num (`int`, *optional*, defaults to 81):
+                How many frames to sample from a video. The number should be 4n+1
+            shift (`float`, *optional*, defaults to 5.0):
+                Noise schedule shift parameter. Affects temporal dynamics
+            sample_solver (`str`, *optional*, defaults to 'unipc'):
+                Solver used to sample the video.
+            sampling_steps (`int`, *optional*, defaults to 40):
+                Number of diffusion sampling steps. Higher values improve quality but slow generation
+            guide_scale (`float`, *optional*, defaults 5.0):
+                Classifier-free guidance scale. Controls prompt adherence vs. creativity
+            n_prompt (`str`, *optional*, defaults to ""):
+                Negative prompt for content exclusion. If not given, use `config.sample_neg_prompt`
+            seed (`int`, *optional*, defaults to -1):
+                Random seed for noise generation. If -1, use random seed.
+            offload_model (`bool`, *optional*, defaults to True):
+                If True, offloads models to CPU during generation to save VRAM
+            batch_size (`int`, *optional*, defaults to 1):
+                Number of videos to generate in parallel
+
+        Returns:
+            torch.Tensor:
+                Generated video frames tensor. Dimensions: (B, C, N, H, W) where:
+                - B: Batch size (batch_size)
+                - C: Color channels (3 for RGB)
+                - N: Number of frames (81)
+                - H: Frame height (from size)
+                - W: Frame width (from size)
+        """
+
+        # preprocess
+        B = batch_size
+        F = frame_num
+        target_shape = (self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
+                        size[1] // self.vae_stride[1],
+                        size[0] // self.vae_stride[2])
+
+        seq_len = math.ceil((target_shape[2] * target_shape[3]) /
+                            (self.patch_size[1] * self.patch_size[2]) *
+                            target_shape[1] / self.sp_size) * self.sp_size
+
+        # Handle input prompts as a batch
+        if n_prompt == "":
+            n_prompt = self.sample_neg_prompt
+        if isinstance(n_prompt, str):
+            n_prompt = [n_prompt]
+
+        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
+        seed_g = torch.Generator(device='cpu')
+        seed_g.manual_seed(seed)
+
+        if not self.t5_cpu:
+            self.text_encoder.model.to(self.device)
+            if isinstance(input_prompt, str):
+                input_prompt = [input_prompt]
+                context = self.text_encoder(input_prompt, self.device) * B
+            else:
+                context = self.text_encoder(input_prompt, self.device)
+
+            context_null = self.text_encoder(n_prompt, self.device) * B
+            if offload_model:
+                self.text_encoder.model.cpu()
+        else:
+            if isinstance(input_prompt, str):
+                input_prompt = [input_prompt]
+                context = self.text_encoder(input_prompt, torch.device('cpu')) * B
+            else:
+                context = self.text_encoder(input_prompt, torch.device('cpu'))
+
+            context_null = self.text_encoder(n_prompt, torch.device('cpu')) * B
+            context = [t.to(self.device) for t in context]
+            context_null = [t.to(self.device) for t in context_null]
+
+        context_null = torch.stack(context_null, dim=0)
+        
+        noise = torch.randn(
+            B,
+            target_shape[0],
+            target_shape[1],
+            target_shape[2],
+            target_shape[3],
+            dtype=torch.float32,
+            device='cpu',
+            generator=seed_g
+        ).to(self.device)
+
+        @contextmanager
+        def noop_no_sync():
+            yield
+
+        no_sync = getattr(self.model, 'no_sync', noop_no_sync)
+
+        if use_apg:
+            apg = APG(guide_scale, apg_momentum, apg_eta, apg_norm_threshold)
+
+        # evaluation mode
+        with amp.autocast('cuda', dtype=self.param_dtype), torch.inference_mode(), no_sync():
+
+            if sample_solver == 'unipc':
+                sample_scheduler = FlowUniPCMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False)
+                sample_scheduler.set_timesteps(
+                    sampling_steps, device=self.device, shift=shift)
+                timesteps = sample_scheduler.timesteps
+            elif sample_solver == 'dpm++':
+                sample_scheduler = FlowDPMSolverMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False)
+                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                timesteps, _ = retrieve_timesteps(
+                    sample_scheduler,
+                    device=self.device,
+                    sigmas=sampling_sigmas)
+            else:
+                raise NotImplementedError("Unsupported solver.")
+
+            # sample videos
+            latents = noise
+
+            arg_c = {'context': context, 'seq_len': seq_len}
+            arg_null = {'context': context_null, 'seq_len': seq_len}
+            if self.rank == 0:
+                logging.info(f"Wan denoising started")
+
+            for step, t in enumerate(tqdm(timesteps)):
+                latent_model_input = latents
+                timestep = [t] * B
+
+                timestep = torch.stack(timestep)
+
+                self.model.to(self.device)
+                noise_pred_cond = self.model(
+                    latent_model_input, t=timestep, **arg_c)
+                noise_pred_uncond = self.model(
+                    latent_model_input, t=timestep, **arg_null)
+
+                if isinstance(noise_pred_cond, list):
+                    noise_pred_cond = torch.stack(noise_pred_cond, dim=0)
+                if isinstance(noise_pred_uncond, list):
+                    noise_pred_uncond = torch.stack(noise_pred_uncond, dim=0)
+
+                if use_apg:
+                    noise_pred = apg.get_apg_noise_pred(
+                        latents,
+                        noise_pred_cond,
+                        noise_pred_uncond,
+                        t
+                    )
+                else:
+                    noise_pred = noise_pred_uncond + guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
+
+                temp_x0 = sample_scheduler.step(
+                    noise_pred,
+                    t,
+                    latents,
+                    return_dict=False,
+                    generator=seed_g)[0]
+                latents = temp_x0
+
+                if interactive_callback is not None and self.rank == 0:
+                    try:
+                        interactive_callback(step, sampling_steps, latents)
+                    except Exception as e:
+                        if self.rank == 0:
+                            logging.error(f"Error in interactive callback, skipping: {e}")
+
+                if dist.is_initialized():
+                    dist.barrier()
+
+            x0 = latents
+            
+            gc.collect()
+            torch.cuda.empty_cache()
+            if self.rank == 0:
+                logging.info("Start vae decoding...")
+                images = torch.cat(self.vae.decode(x0), dim=1)
+                shapes = [images.shape]
+                dtype = [images.dtype]
+                logging.info("End vae decoding")
+            else:
+                images = [None]
+                shapes = [None]
+                dtype = [None]
+
+
+        del noise, latents
+        del sample_scheduler
+
+        if dist.is_initialized():
+            dist.barrier()
+            # dist.broadcast_object_list(shapes, 0)
+            # dist.broadcast_object_list(dtype, 0)
+            # if self.rank != 0:
+            #     images = torch.empty(shapes[0], dtype=dtype[0], device=self.device)
+            # dist.broadcast(images, src=0)
+        
+        return images

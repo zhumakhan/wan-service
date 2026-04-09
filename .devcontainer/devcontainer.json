@@ -1,0 +1,38 @@
+// .devcontainer/devcontainer.json
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/python
+{
+	"name": "Python 3 Dev Container",
+	"build": {
+		// Sets the run context to the root of the project folder
+		"context": "..",
+		// Defines the Dockerfile to use
+		"dockerfile": "../Dockerfile"
+	},
+	// Add the dev container specific VS Code settings here
+	"settings": {
+		"python.defaultInterpreterPath": "/usr/local/bin/python",
+		"python.linting.enabled": true,
+		"python.linting.pylintEnabled": true,
+		"editor.formatOnSave": true
+	},
+	// Add the dev container specific extensions here
+	"extensions": [
+		"ms-python.python",
+		"ms-python.vscode-pylance",
+		"vscode.git"
+	],
+	"mounts": [
+		"source=/home/ubuntu/WAN_t2i_models,target=/app/models,type=bind",
+		"source=/home/ubuntu/WAN_t2i_loras,target=/app/loras,type=bind"
+	],
+	// Use 'postCreateCommand' to run commands after the container is created.
+	// This example installs requirements from a requirements.txt file.
+	"postCreateCommand": "pip3 install -r requirements.txt",
+	"runArgs": [
+		"--gpus",
+		"all"
+	],
+	// Uncomment to connect as a non-root user. See https://aka.ms/vscode-remote/containers/non-root.
+	// "remoteUser": "vscode"
+}

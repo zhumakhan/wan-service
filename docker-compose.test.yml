@@ -1,0 +1,21 @@
+services:
+  wan-image-service:
+    runtime: nvidia
+    build: .
+    command: python3 -m src.main
+    restart: always
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    shm_size: '10gb'
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+    volumes:
+      - '/home/ubuntu/Wan_weights:/app/models'
+    # env_file:
+    #   - .env
+    stop_grace_period: 15s
+    ports:
+      - "8000:8000"
+      - "8001:8001"
