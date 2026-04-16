@@ -41,6 +41,7 @@ def send_test_request(batch, height, width):
     response = requests.post(API_URL, json=payload, timeout=600)
 
     print(f"Status: {response.status_code}")
+    print(f"{batch} x {width} x {height}")
     print(f"Response: {json.dumps(response.json(), indent=2)}")
     return response
 
@@ -49,11 +50,27 @@ if __name__ == "__main__":
     from itertools import product
 
     shapes = [
-        # [1152, 2048],
-        # [1536, 2048],
+        [1152, 2048],
+        [1536, 2048],
+        # [2048, 1536],
+        # [2048, 1152],
         [2048, 2048]
     ]
-    batch_sizes = [4]
+    batch_sizes = [1, 2, 3, 4]
     configs = list(product(batch_sizes, shapes))
-    for batch, (h, w) in configs:
+    for batch, (w, h) in configs:
         send_test_request(batch, h, w)
+# 1xh100
+# b  x  width x  height   latency(s)
+# 1  x  1152  x  2048     24.08520445181057
+# 1  x  1536  x  2048     33.79216889711097
+# 1  x  2048  x  2048     48.576420784927905
+# 2  x  1152  x  2048     48.01689176494256
+# 2  x  1536  x  2048     67.23605569405481
+# 2  x  2048  x  2048     97.41096994886175
+# 3  x  1152  x  2048     72.17914418084547
+# 3  x  1536  x  2048     99.99626521160826
+# 3  x  2048  x  2048     143.9316055700183
+# 4  x  1152  x  2048     95.02980306372046
+# 4  x  1536  x  2048     133.2143324590288
+# 4  x  2048  x  2048     193.21078103780746
