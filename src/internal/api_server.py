@@ -46,10 +46,12 @@ class ApiServer:
         app = FastAPI(lifespan=lifespan)
 
         @app.get("/health")
+        @app.get("/ready")
         async def health():
             return {"status": "ok"}
 
         @app.post("/generate")
+        @app.post("/predict")
         async def generate(payload: Payload):
             result_future: Queue = Queue()
             self._request_queue.put((payload, result_future))
@@ -104,12 +106,13 @@ class ApiServer:
             if payload is not None:
 
                 try:
-                    latency = self.message_processor(payload, None)
+                    result = self.message_processor(payload, None)
                     if self.rank == 0 and result_future is not None:
                         result_future.put({
                             "job_set_id": payload.job_set_id,
                             "status": "completed",
-                            "latency": latency
+                            "latency": result["latency"],
+                            "images": result["images"],
                         })
                 except CriticalError as e:
                     if self.rank == 0:

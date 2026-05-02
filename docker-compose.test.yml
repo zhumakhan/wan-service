@@ -13,8 +13,6 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
     volumes:
       - '/home/ubuntu/Wan_weights:/app/models'
-    # env_file:
-    #   - .env
     stop_grace_period: 15s
     ports:
       - "8000:8000"

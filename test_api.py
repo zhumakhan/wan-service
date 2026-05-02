@@ -1,7 +1,11 @@
+import base64
 import json
+import os
+
 import requests
 
 API_URL = "http://localhost:8001/generate"
+OUTPUT_DIR = "test_outputs"
 
 
 def send_test_request(batch, height, width):
@@ -26,7 +30,7 @@ def send_test_request(batch, height, width):
             "sample_shift": 2,
             "sample_solver": "unipc",
             "sample_steps": 20,
-            "sample_guide_scale": 1.0,
+            "sample_guide_scale": 3.0,
             "base_seed": 1888,
             "batch_size": batch,
             "use_sage_attention": False,
@@ -42,7 +46,20 @@ def send_test_request(batch, height, width):
 
     print(f"Status: {response.status_code}")
     print(f"{batch} x {width} x {height}")
-    print(f"Response: {json.dumps(response.json(), indent=2)}")
+
+    body = response.json()
+    images = body.pop("images", [])
+    print(f"Latency: {body['latency']}")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    for i, b64 in enumerate(images):
+        out_path = os.path.join(
+            OUTPUT_DIR, f"b{batch}_{width}x{height}_{i}.png"
+        )
+        with open(out_path, "wb") as f:
+            f.write(base64.b64decode(b64))
+        print(f"Saved {out_path}")
+
     return response
 
 
@@ -50,13 +67,13 @@ if __name__ == "__main__":
     from itertools import product
 
     shapes = [
-        [1152, 2048],
-        [1536, 2048],
+        # [1152, 2048],
+        # [1536, 2048],
         # [2048, 1536],
-        # [2048, 1152],
-        [2048, 2048]
+        [2048, 1152],
+        # [2048, 2048]
     ]
-    batch_sizes = [1, 2, 3, 4]
+    batch_sizes = [1]
     configs = list(product(batch_sizes, shapes))
     for batch, (w, h) in configs:
         send_test_request(batch, h, w)
